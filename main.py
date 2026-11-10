@@ -17,6 +17,8 @@ NAMES = list(sim.MATERIALS)
 
 
 class State:
+    """Everything the user can change. `dirty` marks a change that still has
+    to be pushed to the GPU (done once per frame by apply())."""
     material = "Pure water"
     c_bulk = 0.0
     wall = True
@@ -40,6 +42,8 @@ def apply(st):
 
 
 def select(st, name):
+    """Switch to another additive. The model tracks one additive at a time, so
+    the liquid is reset to clean water; existing bubbles are kept."""
     st.material, st.c_bulk = name, 0.0
     sim.set_material(name, 0.0, st.wall)
     sim.fill_c(0.0)
@@ -47,6 +51,9 @@ def select(st, name):
 
 
 def set_bulk(st, value):
+    """Change the bulk concentration. The whole surface is shifted by the
+    difference at once, which keeps any drops and gradients already on it;
+    waiting for the slow bulk exchange would make the slider feel dead."""
     if value != st.c_bulk:
         sim.shift_c(value - st.c_bulk)
         st.c_bulk = value
@@ -54,6 +61,11 @@ def set_bulk(st, value):
 
 
 def panel(gui, st, stats):
+    """Draw the two overlay windows and apply what the user changed.
+
+    Window positions and sizes are fractions of the whole window. The labels
+    are English because the built-in UI font has no CJK glyphs.
+    """
     m = sim.MATERIALS[st.material]
     i = st.info
     g = sim.gamma_host(st.material, st.c_bulk)
@@ -101,7 +113,7 @@ def run(shot=None):
     select(st, "Pure water")
     apply(st)
     stats = dict(n=0, bursts=0, merges=0, ms=0.0)
-    carry = 0.0
+    carry = 0.0          # fractional bubbles owed by the emitter
     last = time.perf_counter()
     frame = 0
     if shot:
@@ -112,6 +124,8 @@ def run(shot=None):
 
     while window.running:
         frame += 1
+        # Mouse input is paced by real time, the model by a fixed step: a slow
+        # frame then slows the simulation down instead of making it unstable.
         now = time.perf_counter()
         real_dt, last = min(now - last, 0.05), now
         dt = (1.0 / 60.0) * st.speed
@@ -129,6 +143,9 @@ def run(shot=None):
                     sim.clear_bubbles()
                 elif e.key == "r":
                     sim.fill_c(st.c_bulk)
+            # Cursor is in [0, 1]^2 with the origin at the bottom left, the
+            # same orientation as the image; convert to tank millimetres and
+            # ignore it while it is over the side panel.
             mx, my = window.get_cursor_pos()
             in_view = mx * sim.W < sim.VIEW
             wx, wy = mx * sim.W / sim.VIEW * sim.L, my * sim.L
@@ -141,6 +158,7 @@ def run(shot=None):
         if st.dirty:
             apply(st)
         if not st.paused:
+            # Emitter: bubbles appear at random places at the chosen rate.
             carry += st.emit_rate * dt
             if carry >= 1.0:
                 n = int(carry)
@@ -153,6 +171,7 @@ def run(shot=None):
             stats["n"] = sim.count_alive()
             stats["ms"] = 0.9 * stats["ms"] + 0.1 * (time.perf_counter() - t0) * 1e3
 
+        # The frame is drawn on the GPU into one image; the UI goes on top.
         sim.render(int(st.show_gamma))
         canvas.set_image(sim.img)
         panel(gui, st, stats)
@@ -166,6 +185,7 @@ def test(out):
     """Scripted run: every material, bubbles + a drop in the middle, with stats."""
     out = Path(out)
     out.mkdir(parents=True, exist_ok=True)
+    # the GPU Bessel approximation against SciPy, on both branches (x <= 2, x > 2)
     from scipy.special import k1
     xs = [0.05, 0.5, 1.0, 2.0, 2.5, 6.0]
     err = max(abs(sim.k1_probe(x) / k1(x) - 1) for x in xs)
@@ -196,6 +216,7 @@ def test(out):
                 tag = f"{name.split()[0].lower()}_{c:g}_t{(f + 1) / 60:.1f}"
                 ti.tools.imwrite(sim.img, str(out / f"{tag}.png"))
         ms = (time.perf_counter() - t0) / 600 * 1e3
+        # a blown-up run shows as NaN or infinity in the fields
         cf = sim.c0.to_numpy()
         ok = np.isfinite(cf).all() and np.isfinite(sim.pos.to_numpy()).all()
         i = st.info

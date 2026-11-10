@@ -28,19 +28,36 @@ _CACHE = Path(__file__).with_name("yl_table.npz")
 
 
 def _wall(b):
-    """Integrate the wall from the apex (curvature jump b) until it turns over."""
+    """Integrate the wall from the apex (curvature jump b) until it turns over.
+
+    The curve is parametrised by arc length s, starting at the lowest point of
+    the bubble. State y = [r, zeta, phi, V]:
+      r    distance from the axis
+      zeta height above the apex
+      phi  angle of the tangent from horizontal (0 at the apex, pi/2 at the
+           equator, pi where the wall has turned back to horizontal)
+      V    volume enclosed below the current height
+    The pressure jump across the wall at height zeta is b + zeta: b at the
+    apex, growing upward because the liquid pressure falls hydrostatically.
+    Measuring height from the apex makes the curve depend on b alone, so it is
+    integrated once and reused for every trial depth in solve().
+    """
     def f(s, y):
         r, ze, ph, _ = y
         sp = np.sin(ph)
+        # Young-Laplace: total curvature = pressure jump. The total curvature
+        # is d(phi)/ds (in the drawing plane) + sin(phi)/r (around the axis).
         return [np.cos(ph), sp, b + ze - sp / r, np.pi * r * r * sp]
 
-    def top(s, y):
+    def top(s, y):                 # stop when the wall is horizontal again
         return y[2] - np.pi
     top.terminal = True
 
-    def equator(s, y):
+    def equator(s, y):             # recorded, the junction lies above it
         return y[2] - 0.5 * np.pi
 
+    # sin(phi)/r is 0/0 on the axis, so start a tiny step away from the apex
+    # using the series of a sphere of radius 2/b.
     e = 1e-4 * min(1.0, 2.0 / b)
     y0 = [e, b * e * e / 4, b * e / 2, 0.0]
     sol = solve_ivp(f, (e, 400.0), y0, events=(top, equator), dense_output=True,
@@ -51,7 +68,16 @@ def _wall(b):
 
 
 def _meniscus(rc, zc, psi, dense=False):
-    """Shoot the meniscus outward. Returns +1 if it ends too high, -1 too low."""
+    """Shoot the meniscus outward. Returns +1 if it ends too high, -1 too low.
+
+    Starts at the junction ring (radius rc, height zc) descending at angle psi
+    below horizontal. The true meniscus decays to z = 0 at infinity, but that
+    solution is unstable when integrated outward: any error grows like e^r.
+    The instability is used as the test. A start that is too high flattens out
+    (psi reaches 0) while still above the level and then curls upward; one that
+    is too low crosses z = 0 while still descending. Whichever happens first
+    tells solve() which way to move.
+    """
     if zc <= 0:
         return -1, None
     if psi <= 1e-12:
@@ -59,6 +85,8 @@ def _meniscus(rc, zc, psi, dense=False):
 
     def f(s, y):
         r, z, p = y
+        # Liquid at height z is at pressure -z relative to the air, and the
+        # surface curvature must balance it: d(psi)/ds + sin(psi)/r = -z.
         return [np.cos(p), -np.sin(p), -z - np.sin(p) / r]
 
     def flat(s, y):
@@ -77,7 +105,15 @@ def _meniscus(rc, zc, psi, dense=False):
 
 
 def _junction(wall, s_eq, s_end, P):
-    """Point on the wall where a cap of radius 4/P joins tangentially."""
+    """Point on the wall where a cap of radius 4/P joins tangentially.
+
+    The cap is a soap film with two faces, so the gas pressure P is held by a
+    sphere of radius 4/P (a single interface would give 2/P). A sphere centred
+    on the axis has r = R_cap sin(angle), so the junction is where the wall
+    satisfies r = (4/P) sin(phi). Buoyancy makes the wall flatten out at a
+    finite radius instead of closing on the axis, which is why such a point
+    exists between the equator and the top.
+    """
     def g(s):
         y = wall(s)
         return y[0] - (4.0 / P) * np.sin(y[2])
@@ -87,18 +123,34 @@ def _junction(wall, s_eq, s_end, P):
 
 
 def solve(b):
-    """Full shape for apex curvature jump b. Returns a dict (units of l_c)."""
+    """Full shape for apex curvature jump b. Returns a dict (units of l_c).
+
+    b selects one member of the one-parameter family of bubbles (large b =
+    small bubble). The remaining unknown is how deep the bubble sits: zb, the
+    height of its apex relative to the far liquid level. It is found by
+    bisection so that the meniscus leaving the junction decays to that level.
+
+    Returned keys: R volume-equivalent radius, P gas pressure, zb / zc heights
+    of the apex and the junction ring, rc junction (cap) radius, th cap
+    half-angle, Rcap cap radius of curvature, rmax widest radius, Q capillary
+    charge, wall_r and men_z the sampled profiles.
+    """
     wall, s_eq, s_end = _wall(b)
     ze_top = wall(s_end)[1]
 
     def trial(zb):
+        # The apex jump is b = P + zb (gas pressure minus liquid pressure at
+        # depth zb), so the depth fixes the gas pressure and with it the cap.
         P = b - zb
         sc = _junction(wall, s_eq, s_end, P)
         if sc is None:
             return -1, None
         r, ze, ph, V = wall(sc)
+        # The meniscus leaves tangent to the wall: its descent angle is pi - phi.
         return _meniscus(r, zb + ze, np.pi - ph)[0], sc
 
+    # Bracket: lowest puts the whole wall below the level (meniscus too low),
+    # highest is the limit P -> 0 (flat cap, meniscus too high).
     lo, hi = -ze_top - 0.01, b * (1 - 1e-9)
     for _ in range(70):
         mid = 0.5 * (lo + hi)
@@ -112,11 +164,13 @@ def solve(b):
     rc, ze_c, ph_c, Vw = wall(sc)
     zc, th = zb + ze_c, np.pi - ph_c
     Rcap = 4.0 / P
+    # gas volume = part enclosed by the wall + the spherical cap above the ring
     hcap = Rcap * (1 - np.cos(th))
     V = Vw + np.pi * hcap * hcap * (3 * Rcap - hcap) / 3
     R = (3 * V / (4 * np.pi)) ** (1 / 3)
 
-    # wall radius on a uniform z grid
+    # wall radius on a uniform z grid (height is monotonic along the wall, so
+    # a single r per height describes it; used for drawing the side view)
     s = np.linspace(0.0, sc, 4000)[1:]
     ys = wall(np.maximum(s, 1e-9 * sc))
     ze_s = np.concatenate([[0.0], ys[1]])
@@ -124,7 +178,12 @@ def solve(b):
     wall_r = np.interp(np.linspace(0.0, ze_c, NW), ze_s, r_s)
     rmax = max(r_s.max(), rc)
 
-    # meniscus height on a uniform r grid; K0 tail past the matching radius
+    # Meniscus height on a uniform r grid. Far from the bubble the slope is
+    # small and the equation becomes linear with solution z = Q K0(r). Q is
+    # read off the numerical solution at the matching radius; it measures how
+    # strongly the bubble deforms the surface and sets the attraction between
+    # bubbles. Past the matching radius the K0 tail replaces the shot solution,
+    # which would eventually diverge.
     _, msol = _meniscus(rc, zc, th, dense=True)
     sm = np.linspace(0.0, msol.t[-1], 6000)
     ym = msol.sol(sm)
@@ -139,6 +198,7 @@ def solve(b):
 
 
 def build_table(n=56, b_lo=0.012, b_hi=70.0, verbose=True):
+    """Solve n shapes spanning R / l_c from about 0.03 to 4.9, sorted by R."""
     rows = []
     for k, b in enumerate(np.geomspace(b_hi, b_lo, n)):
         try:
@@ -156,6 +216,7 @@ def build_table(n=56, b_lo=0.012, b_hi=70.0, verbose=True):
 
 
 def load_table():
+    """Shape table from the cache file, solving and saving it on first use."""
     if _CACHE.exists():
         return dict(np.load(_CACHE))
     print("Solving Young-Laplace bubble shapes (first run only)...")
@@ -165,7 +226,12 @@ def load_table():
 
 
 def shape_at(tab, Rn):
-    """Interpolated shape for dimensionless radius Rn = R / l_c."""
+    """Interpolated shape for dimensionless radius Rn = R / l_c.
+
+    Linear in log(R) between the two neighbouring table entries, applied to
+    every scalar and to the sampled profiles alike. Outside the table range the
+    nearest entry is returned; the caller rescales it to the requested size.
+    """
     lr = np.log(tab["R"])
     x = float(np.clip(np.log(Rn), lr[0], lr[-1]))
     i = int(np.clip(np.searchsorted(lr, x) - 1, 0, len(lr) - 2))

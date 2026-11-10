@@ -49,6 +49,16 @@ POP_T = 0.3        # pop ring animation, s
 # ---- materials ---------------------------------------------------------------
 # gamma(c) = GAMMA_W + A * ln(1 + B c) / ln(1 + B), c clamped to [0, 1].
 # A small B gives a linear law. c = 1 means `cmax` in the unit shown.
+#   A, B      surface tension law: A is the total change at c = 1 (negative
+#             lowers the tension), B how sharply it happens at low c
+#   s_max,    film stability S(c) = s_max c / (c + s_half), between 0 and 1.
+#   s_half    Surfactants make the film surfaces rigid, which slows drainage
+#             and stops touching bubbles from merging
+#   antifoam  fraction by which the additive shortens the drainage time
+#   v1, v4    viscosity relative to water = exp(v1 c + v4 c^4)
+#   c_inh     concentration above which coalescence is suppressed (the
+#             salt transition near 0.1 mol/L)
+#   tint      colour the additive gives the liquid on screen
 MATERIALS = {
     "Pure water": dict(A=0.0, B=1.0, s_max=0.0, s_half=1.0, antifoam=0.0,
                        v1=0.0, v4=0.0, c_inh=1e9, tint=(0.04, 0.10, 0.18),
@@ -67,12 +77,17 @@ MATERIALS = {
                      unit="mass frac", cmax=1.0),
 }
 
+# The active material lives in one GPU-side struct that every kernel reads, so
+# switching liquid or moving a slider needs no recompilation.
 Params = ti.types.struct(A=ti.f32, B=ti.f32, s_max=ti.f32, s_half=ti.f32,
                          antifoam=ti.f32, v1=ti.f32, v4=ti.f32, c_inh=ti.f32,
                          c_bulk=ti.f32, wall=ti.f32, tint=ti.math.vec3)
 P = Params.field(shape=())
 
 # ---- Young-Laplace lookup table ------------------------------------------------
+# Three shape ratios as functions of R / l_c, sampled uniformly in log(R / l_c)
+# and interpolated on the GPU. Because l_c depends on the local surface
+# tension, the same bubble changes shape as the liquid under it changes.
 YL = bubble_shape.load_table()
 NT = 64
 T_LO, T_HI, _tab = bubble_shape.sim_table(YL, NT)
@@ -81,9 +96,12 @@ tab = ti.Vector.field(3, ti.f32, shape=NT)
 tab.from_numpy(_tab)
 
 # ---- fields -----------------------------------------------------------------
+# c0 holds the current concentration; c1 is the scratch buffer of the explicit
+# diffusion step (read one, write the other, then swap roles).
 c0 = ti.field(ti.f32, shape=(NG, NG))      # surface concentration (normalised)
 c1 = ti.field(ti.f32, shape=(NG, NG))
 
+# Bubbles are a fixed pool of MAXB slots; `alive` marks the ones in use.
 pos = ti.Vector.field(2, ti.f32, shape=MAXB)
 vel = ti.Vector.field(2, ti.f32, shape=MAXB)
 frc = ti.Vector.field(2, ti.f32, shape=MAXB)
@@ -145,6 +163,15 @@ def stability(c):
 
 @ti.func
 def d_eff(c):
+    """Effective diffusivity of the additive along the surface.
+
+    The surface flows toward higher tension with velocity KM * grad(gamma) and
+    carries the additive with it. With gamma = gamma(c) the transport flux
+    c * KM * gamma'(c) * grad(c) has the form of diffusion with coefficient
+    KM * c * |gamma'|, as long as the additive lowers the tension. For one
+    that raises it (salt) the same term would un-mix the liquid, so it is
+    dropped and only the background mixing D0 remains.
+    """
     return D0 + KM * ti.max(c, 0.0) * ti.max(-dgamma_dc(c), 0.0)
 
 
@@ -189,19 +216,30 @@ def sample_c(p):
 
 @ti.func
 def _diffuse_step(a: ti.template(), b: ti.template(), dt: ti.f32):
+    """One explicit finite-volume step, reading field a and writing field b."""
     for i, j in a:
         cc = a[i, j]
         dc = d_eff(cc)
         acc = 0.0
         for off in ti.static(((1, 0), (-1, 0), (0, 1), (0, -1))):
+            # Clamping the index makes a boundary cell its own neighbour:
+            # zero flux through the tank walls.
             cn = a[ti.math.clamp(i + off[0], 0, NG - 1), ti.math.clamp(j + off[1], 0, NG - 1)]
+            # Flux through the shared face uses the mean diffusivity of the two
+            # cells, so what leaves one cell enters the other exactly.
             acc += 0.5 * (dc + d_eff(cn)) * (cn - cc)
+        # Last term: the surface slowly exchanges additive with the liquid below.
         b[i, j] = cc + dt * (acc / (DX * DX) + (P[None].c_bulk - cc) / TAU_BULK)
 
 
 @ti.kernel
 def diffuse8(dt: ti.f32):
-    """Eight explicit steps of d c/dt = div(D_eff grad c) + bulk exchange."""
+    """Eight explicit steps of d c/dt = div(D_eff grad c) + bulk exchange.
+
+    Batching eight steps into one kernel cuts the launch overhead, which
+    matters because the stability limit forces hundreds of steps per frame.
+    The static loop is unrolled at compile time, ending with the result in c0.
+    """
     for _ in ti.static(range(4)):
         _diffuse_step(c0, c1, dt)
         _diffuse_step(c1, c0, dt)
@@ -221,6 +259,8 @@ def shift_c(dv: ti.f32):
 
 @ti.kernel
 def add_drop(x: ti.f32, y: ti.f32, amount: ti.f32, sigma: ti.f32):
+    """Add a Gaussian blob of additive. Values above 1 act as a reservoir:
+    the tension law is flat there, so the excess only feeds the spreading edge."""
     for i, j in c0:
         d2 = ((i + 0.5) * DX - x) ** 2 + ((j + 0.5) * DX - y) ** 2
         c0[i, j] = ti.min(c0[i, j] + amount * ti.exp(-d2 / (2 * sigma * sigma)), 1.5)
@@ -235,6 +275,7 @@ def max_diffusivity():
 # ---- bubbles -------------------------------------------------------------------
 @ti.func
 def table(rn):
+    """Shape ratios (r_c / R^2, r_max / R, log Q / R^3) for rn = R / l_c."""
     t = (ti.log(rn) - T_LO) / (T_HI - T_LO) * (NT - 1)
     t = ti.math.clamp(t, 0.0, NT - 1.001)
     i = ti.cast(t, ti.i32)
@@ -243,23 +284,33 @@ def table(rn):
 
 @ti.kernel
 def derive():
+    """Refresh what each bubble needs from the liquid directly beneath it."""
     for i in range(MAXB):
         if alive[i]:
             c, gc = sample_c(pos[i])
             g = gamma_of(c)
-            lc = ti.sqrt(g / (RHO * GRAV))
+            lc = ti.sqrt(g / (RHO * GRAV))       # local capillary length
             rn = rad[i] / lc
             t = table(rn)
             b_c[i], b_gam[i], b_lc[i] = c, g, lc
+            # The table is dimensionless (lengths in l_c); convert back to mm.
             b_rc[i] = t[0] * rn * rn * lc
             b_rf[i] = ti.max(t[1] * rad[i], b_rc[i])
             b_Q[i] = ti.exp(t[2]) * rn**3 * lc
+            # A body accelerating in liquid drags liquid along; for a sphere
+            # that added mass is half the displaced mass. The gas weighs nothing.
             b_m[i] = 0.5 * RHO * 4.0 / 3.0 * PI * rad[i] ** 3
+            # Marangoni surface flow: grad(gamma) = gamma'(c) grad(c).
             b_us[i] = KM * dgamma_dc(c) * gc
 
 
 @ti.kernel
 def forces(dt: ti.f32):
+    """Capillary and contact forces on every bubble, all pairs (O(N^2)).
+
+    The outer loop runs in parallel on the GPU, one thread per bubble; each
+    thread only writes its own frc[i], so there are no write conflicts.
+    """
     for i in range(MAXB):
         if alive[i]:
             f = ti.Vector([0.0, 0.0])
@@ -268,11 +319,16 @@ def forces(dt: ti.f32):
                 if j != i and alive[j]:
                     d = pos[j] - p
                     dist = d.norm() + 1e-6
+                    # Pair properties are symmetric averages so that the force
+                    # on i from j is equal and opposite to that on j from i.
                     lij = 0.5 * (b_lc[i] + b_lc[j])
                     rsum = b_rf[i] + b_rf[j]
-                    if dist < rsum + 7.0 * lij:
+                    if dist < rsum + 7.0 * lij:       # K1 is negligible beyond
                         n = d / dist
                         gij = 0.5 * (b_gam[i] + b_gam[j])
+                        # Each bubble sits in the tilted meniscus of the other
+                        # and climbs it. K1 diverges at zero distance, so the
+                        # argument is not allowed below a fraction of contact.
                         x = ti.max(dist, 0.6 * rsum) / lij
                         # far-field formula overshoots near contact for R > l_c:
                         # a capillary force cannot exceed ~ gamma * size
@@ -280,6 +336,9 @@ def forces(dt: ti.f32):
                         f += n * ti.min(fa, gij * ti.min(b_rf[i], b_rf[j]))
                         ov = rsum - dist
                         if ov > 0:
+                            # Contact: a spring as stiff as the explicit time
+                            # step allows (k dt^2 / m = 0.2), plus damping of
+                            # the approach velocity so pairs do not bounce.
                             mred = b_m[i] * b_m[j] / (b_m[i] + b_m[j])
                             k = 0.2 * mred / (dt * dt)
                             vrel = (vel[j] - vel[i]).dot(n)
@@ -301,12 +360,21 @@ def forces(dt: ti.f32):
 
 @ti.kernel
 def integrate(dt: ti.f32):
+    """Advance velocities and positions: m dv/dt = F - zeta (v - u_surface)."""
     for i in range(MAXB):
         if alive[i]:
             mu = MU_W * mu_rel(b_c[i])
+            # Drag acts on the velocity relative to the moving surface, which
+            # is how Marangoni flow carries bubbles along.
             rel = vel[i] - b_us[i]
             re = RHO * rel.norm() * 2.0 * rad[i] / mu
+            # Half the Stokes drag of a sphere (the bubble is only partly
+            # surrounded by liquid) times the Schiller-Naumann correction,
+            # which accounts for inertia of the flow at Reynolds numbers > 1.
             zeta = 3.0 * PI * mu * rad[i] * (1.0 + 0.15 * re**0.687)
+            # The drag term is treated implicitly (it appears on both sides and
+            # is solved for the new velocity). Small bubbles have a drag time
+            # far shorter than the step; an explicit update would blow up.
             a = dt * zeta / b_m[i]
             vel[i] = (vel[i] + dt * frc[i] / b_m[i] + a * b_us[i]) / (1.0 + a)
             q = pos[i] + dt * vel[i]
@@ -316,7 +384,14 @@ def integrate(dt: ti.f32):
 
 @ti.kernel
 def separate():
-    """Bubbles cannot interpenetrate: push overlapping pairs apart (one Jacobi pass)."""
+    """Bubbles cannot interpenetrate: push overlapping pairs apart (one Jacobi pass).
+
+    The contact spring alone is too soft inside a large raft, where many
+    neighbours pull inward at once. Each bubble is moved out of its overlaps,
+    the lighter one of a pair moving more. All corrections are computed from
+    the old positions first (stored in frc, free at this point) and applied
+    afterwards, so the result does not depend on thread order.
+    """
     for i in range(MAXB):
         if alive[i]:
             d = ti.Vector([0.0, 0.0])
@@ -340,10 +415,15 @@ def drain(dt: ti.f32) -> ti.i32:
     for i in range(MAXB):
         if alive[i]:
             c = b_c[i]
+            # Drainage time of the cap film: slower in a viscous liquid, much
+            # slower when surfactant stiffens the film surfaces, faster with an
+            # antifoam. tauf is the bubble's own random factor.
             af = 1.0 - P[None].antifoam * ti.min(ti.max(c, 0.0) / 0.3, 1.0)
             taud = TAU_W * tauf[i] * mu_rel(c) * (1.0 + ASTAB * stability(c)) * af
-            film[i] -= dt * film[i] / taud
+            film[i] -= dt * film[i] / taud            # exponential thinning
             age[i] += dt
+            # Rupture is random: the chance per second rises steeply as the
+            # film nears the critical thickness, and is certain below it.
             hazard = (3.0 * HCRIT / film[i]) ** 2 / taud
             if film[i] < HCRIT or rad[i] > R_MAX or ti.random() < 1.0 - ti.exp(-hazard * dt):
                 alive[i] = 0
@@ -356,6 +436,11 @@ def drain(dt: ti.f32) -> ti.i32:
 
 @ti.func
 def hash01(a, b, f):
+    """Pseudo-random number in [0, 1) that is a pure function of its inputs.
+
+    Both bubbles of a pair must draw the same number to agree on whether they
+    merge; ti.random() would give each GPU thread a different one.
+    """
     x = ti.cast(a, ti.u32) * ti.u32(73856093) ^ ti.cast(b, ti.u32) * ti.u32(19349663) \
         ^ ti.cast(f, ti.u32) * ti.u32(83492791)
     x ^= x >> 16
@@ -368,7 +453,13 @@ def hash01(a, b, f):
 
 @ti.kernel
 def pick_partners(dt: ti.f32, frame: ti.i32):
-    """Each bubble picks at most one touching neighbour to coalesce with."""
+    """Each bubble picks at most one touching neighbour to coalesce with.
+
+    Merging changes two bubbles at once, which is unsafe to do directly in a
+    parallel loop. So it is split: here every bubble only records a choice
+    (the touching neighbour with the lowest shared random draw that passes the
+    merge probability), and merge() acts on pairs that chose each other.
+    """
     for i in range(MAXB):
         best, score = -1, 2.0
         if alive[i]:
@@ -377,6 +468,8 @@ def pick_partners(dt: ti.f32, frame: ti.i32):
                     dist = (pos[j] - pos[i]).norm()
                     if dist < 1.02 * (b_rf[i] + b_rf[j]):
                         c = 0.5 * (b_c[i] + b_c[j])
+                        # The liquid film between the two must drain first:
+                        # slower when viscous, blocked by surfactant or salt.
                         rate = MERGE0 / mu_rel(c) * (1.0 - stability(c)) ** 6 \
                             / (1.0 + (ti.max(c, 0.0) / P[None].c_inh) ** 2)
                         u = hash01(ti.min(i, j), ti.max(i, j), frame)
@@ -387,10 +480,14 @@ def pick_partners(dt: ti.f32, frame: ti.i32):
 
 @ti.kernel
 def merge() -> ti.i32:
+    """Fuse mutually chosen pairs into the lower slot. Returns the merge count."""
     n = 0
     for i in range(MAXB):
         j = partner[i]
+        # Mutual choice means no third bubble touches this pair's data, and
+        # j > i makes exactly one of the two threads do the work.
         if j > i and partner[j] == i:
+            # Volume is conserved; position and velocity are volume-weighted.
             vi, vj = rad[i] ** 3, rad[j] ** 3
             wi = vi / (vi + vj)
             pos[i] = pos[i] * wi + pos[j] * (1 - wi)
@@ -447,7 +544,13 @@ def gamma_colour(g):
 
 @ti.func
 def film_colour(h):
-    """Thin-film interference colour for a water film of thickness h (um)."""
+    """Thin-film interference colour for a water film of thickness h (um).
+
+    Light reflected from the two faces of the film interferes; the reflected
+    intensity at wavelength lam goes as sin^2(2 pi n h / lam) with n = 1.33.
+    Evaluated for red, green and blue. Thick films mix many orders and look
+    silvery, very thin ones reflect almost nothing ("black film").
+    """
     lam = ti.Vector([0.65, 0.53, 0.45])
     col = ti.Vector([0.0, 0.0, 0.0])
     for k in ti.static(range(3)):
@@ -458,7 +561,12 @@ def film_colour(h):
 
 @ti.func
 def region(k, r, z):
-    """Side view: 0 = air, 1 = liquid, 2 = gas inside the bubble."""
+    """Side view: 0 = air, 1 = liquid, 2 = gas inside the bubble.
+
+    Classifies the point (r, z) of the cross-section of profile k. Below the
+    junction ring the bubble is bounded by the tabulated wall, above it by the
+    spherical cap; outside the ring the liquid reaches up to the meniscus.
+    """
     zb, zc, rc, rcap, th = prof_s[k, 0], prof_s[k, 1], prof_s[k, 2], prof_s[k, 3], prof_s[k, 4]
     res = 0
     gas = False
@@ -485,7 +593,9 @@ def region(k, r, z):
 
 @ti.kernel
 def render(show_gamma: ti.i32):
-    # top view: liquid surface
+    """Draw the whole frame into `img` on the GPU."""
+    # top view: liquid surface, tinted by concentration (or coloured by
+    # tension), with spreading fronts brightened where the gradient is steep
     for x, y in ti.ndrange(VIEW, VIEW):
         c, gc = sample_c(ti.Vector([x + 0.5, y + 0.5]) * (L / VIEW))
         col = ti.Vector([0.04, 0.10, 0.18])
@@ -496,7 +606,9 @@ def render(show_gamma: ti.i32):
         front = ti.min(ti.abs(dgamma_dc(c)) * gc.norm() / 6000.0, 1.0)
         img[x, y] = col + 0.25 * front
 
-    # top view: bubbles and pop rings
+    # top view: bubbles and pop rings. Each bubble paints only the pixels of
+    # its own bounding box; bubbles barely overlap, so parallel threads rarely
+    # touch the same pixel and the result is stable.
     s = VIEW / L
     for i in range(MAXB):
         if alive[i] or popt[i] > 0:
@@ -515,6 +627,9 @@ def render(show_gamma: ti.i32):
                     if alive[i]:
                         aa = ti.math.clamp((1.0 - d) * rp + 0.5, 0.0, 1.0)
                         if aa > 0:
+                            # body with a bright rim, the film cap coloured by
+                            # its thickness (thinner at the top, hence rings),
+                            # and a highlight
                             rim = ti.math.smoothstep(0.7, 1.0, d)
                             col = base * 1.15 + 0.04 + ti.Vector([0.55, 0.68, 0.80]) * rim * 0.55
                             dc = d * b_rf[i] / b_rc[i]
@@ -529,7 +644,8 @@ def render(show_gamma: ti.i32):
                         ring = ti.math.clamp(1.2 - ti.abs(1.0 - d) * rp, 0.0, 1.0)
                         img[x, y] = base + ring * 0.6 * popt[i] / POP_T
 
-    # side panel
+    # side panel: fill each pixel by region, and draw an outline wherever the
+    # region changes between neighbouring pixels
     liquid = ti.Vector([0.05, 0.16, 0.30])
     liquid = liquid + (P[None].tint - liquid) * ti.min(P[None].c_bulk, 1.0) * 0.45
     for x, y in ti.ndrange((VIEW, W), H):
@@ -625,16 +741,21 @@ def step(dt, substeps=8):
     """Advance the whole model by dt seconds. Returns (bursts, merges)."""
     global _frame
     _frame += 1
+    # 1. Additive transport. Explicit diffusion is stable only for steps below
+    #    dx^2 / (4 D); 0.2 leaves a margin. Fast Marangoni spreading makes D
+    #    large, so one frame takes many small steps.
     dt_d = 0.2 * DX * DX / max_diffusivity()
     calls = max(1, math.ceil(dt / dt_d / 8))
     for _ in range(calls):
         diffuse8(dt / (calls * 8))
+    # 2. Bubble motion, in smaller steps than the frame so contacts stay stiff.
     h = dt / substeps
     for _ in range(substeps):
         derive()
         forces(h)
         integrate(h)
         separate()
+    # 3. Slow processes once per frame: film drainage, bursting, coalescence.
     derive()
     bursts = drain(dt)
     pick_partners(dt, _frame)
