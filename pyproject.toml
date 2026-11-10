@@ -1,0 +1,9 @@
+[project]
+name = "water-bubble"
+version = "0.1.0"
+requires-python = ">=3.12"
+dependencies = [
+    "numpy>=2.5.4",
+    "scipy>=1.18.1",
+    "taichi>=1.7.4",
+]
